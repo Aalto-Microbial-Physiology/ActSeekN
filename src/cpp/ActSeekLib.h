@@ -36,6 +36,8 @@ namespace py = pybind11;
 
 extern bool* cuda_check_distances(float* coord_vecs1, float* coord_vecs2, float* distances_vecs, int* distances_offsets, int* distances_sizes, int n_vecs, int n_dim, float threshold);
 extern bool is_gpu_available();
+void set_gpu_enabled(bool enabled);
+bool gpu_enabled();
 
 using profile_t = tuple<string, vector<Eigen::Vector3d>, vector<Eigen::Vector3d>, unordered_map<int, string>, unordered_map<int, int>>;
 // using entry_t = tuple<vector<int>, string, string, vector<Eigen::Vector3d>, vector<Eigen::Vector3d>, vector<Eigen::Vector3d>,
@@ -221,12 +223,8 @@ tuple<double, vector<double>, double, vector<Eigen::Vector3d>, vector<pair<int, 
     const double aa_around,
     const double threshold);
 
-double score(vector<int> vec, double size);
-double score_vector(vector<int> vec);
-
-tuple<vector<Eigen::Vector3d>, vector<Eigen::Vector3d>, vector<double>, vector<int>> find_nearest_neighbors(
-    const vector<Eigen::Vector3d>& vector1,
-    const vector<Eigen::Vector3d>& vector2);
+double calculate_score(vector<int>& indices, double weight);
+double score_vector(vector<int>& indices);
 
 tuple<double, double, double> get_global_distance(
     const vector<Eigen::Vector3d>& coords1,

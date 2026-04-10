@@ -29,13 +29,13 @@ if sys.platform.startswith("win"):
     extra_compile_args = ["/std:c++17"]
     cuda_path = os.environ.get(
         "CUDA_PATH",
-        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v11.8",
+        "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12.2",
     )
     lib_dir = "lib/x64"
     kernel_suffix = ".obj"
 else:
     extra_compile_args = ["-std=c++17", "-O3", "-ffast-math", "-march=native"]
-    cuda_path = os.environ.get("CUDA_PATH", "/usr/local/cuda")
+    cuda_path = os.environ.get("CUDA_PATH", "/usr/local/cuda-12.2")
     lib_dir = "lib64"
     kernel_suffix = ".o"
 

@@ -98,14 +98,11 @@ The HDF5 loader validates entries and skips malformed records before they reach 
 
 ## Input Format
 
-For batch mode, pass a CSV file with an `Entry` column. `Entry` values may be empty if `Sequence` is available.
+For batch mode, pass a CSV file with an `Entry` column.
 
 Supported columns:
 
 - `Entry`: UniProt accession
-- `Entry_seq_ref`: optional sequence reference identifier
-- `Sequence`: amino-acid sequence used for fallback inference
-- `EC` or `EC number`: optional EC number used to narrow fallback resolution
 
 ## Usage
 
@@ -121,15 +118,16 @@ python python/main.py -p P12345
 python python/main.py -f data/proteins_yeast.csv
 ```
 
-### Fallback resolution
+### Structure resolution
 
-If a UniProt accession is missing or unusable, the pipeline can infer a fallback UniProt in this order:
+For each input `Entry`, the pipeline looks for a structure in this order:
 
-1. `Entry_seq_ref` lookup in UniProt
-2. same-EC UniProt search plus sequence ranking
-3. broad HMMER sequence search
+1. `structures/AF-<Entry>-F1-model_v6.pdb`
+2. `structures/<Entry>.pdb`
+3. `structures/<Entry>.cif`
+4. AlphaFold download for `AF-<Entry>-F1-model_v6.pdb`
 
-Only fallback accessions with an available AlphaFold structure are accepted.
+If none of these succeeds, the row is treated as failed.
 
 ## Outputs
 
@@ -137,22 +135,13 @@ Only fallback accessions with an available AlphaFold structure are accepted.
 
 Main result files are written to `results/`:
 
-- direct match: `actseekn-<uniprot>-results.csv`
-- fallback used: `actseekn-<original>-inferred-<resolved>-results.csv`
+- `actseekn-<uniprot>-results.csv`
 
 ### Additional reports for batch runs
 
 When running with `-f`, the pipeline also writes:
 
 - `results/<input_stem>_failed.csv`: input rows that were skipped or failed
-- `results/<input_stem>_fallbacks.csv`: rows that used fallback UniProt inference
-
-`fallbacks.csv` contains:
-
-- `resolved_uniprot`
-- `original_uniprot`
-- `seq_ref`
-- `inferring_method`
 
 ### Structure cache
 
@@ -163,10 +152,8 @@ Downloaded AlphaFold structures are stored in `structures/`.
 The pipeline may need internet access for:
 
 - AlphaFold structure download
-- UniProt REST queries
-- EBI HMMER sequence search
 
-Rows with direct valid UniProt accessions can often run with less network work if the AlphaFold structure is already cached locally.
+Rows with locally available structure files can run without downloading from AlphaFold.
 
 ## SLURM Example
 

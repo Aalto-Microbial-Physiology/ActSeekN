@@ -628,34 +628,37 @@ tuple<double, vector<double>, double, vector<Eigen::Vector3d>, vector<pair<int, 
     return make_tuple(final_dist, distances_selected, distances_around_f, t_transformed_f, solution, translation_vector_f, rotation_f);
 }
 
-double score(vector<int> vec, double size) {
+double calculate_score(vector<int>& indices, double weight) {
     int chunk_count = 0;
     int current_chunk = 1;
-    for (int i = 1; i < vec.size(); ++i) {
-        if (vec[i] == vec[i - 1] + 1) {
-            current_chunk += 1;
-        }
-        if (current_chunk > size) {
-            chunk_count += 1;
+
+    for (int i = 1; i < indices.size(); ++i) {
+        if (indices[i] == indices[i - 1] + 1) ++current_chunk;
+        if (current_chunk > weight) {
+            ++chunk_count;
             current_chunk = 1;
         }
     }
-    // Check the last chunk
-    if (current_chunk > size) {
-        chunk_count += 1;
-    }
-    return static_cast<double>(chunk_count) * size / vec.size();
+    if (current_chunk > weight) ++chunk_count;
+
+    return chunk_count * weight;
 }
 
-double score_vector(vector<int> vec) {
-    vector<double> scores_weights = {5.0, 10.0, 15.0, 20.0};
-    double weighted_scores_sum = 0.0;
-    double weights_sum = 0.0;
-    for (double w: scores_weights) {
-        weighted_scores_sum += score(vec, w) * w;
-        weights_sum += w;
+double score_vector(vector<int>& indices) {
+    constexpr double scores_weights[] = {5.0, 10.0, 15.0, 20.0};
+    vector<double> scores;
+    for (auto& weight : scores_weights) {
+        scores.push_back(calculate_score(indices, weight));
     }
-    return weighted_scores_sum / weights_sum;
+
+    double avgval = 0.0;
+    double sum_weights = 0.0;
+    for (int i = 0; i < 4; ++i) {
+        avgval += scores[i] * scores_weights[i];
+        sum_weights += scores_weights[i];
+    }
+
+    return avgval /= sum_weights;
 }
 
 tuple<vector<Eigen::Vector3d>, vector<Eigen::Vector3d>, vector<double>, vector<int>> find_nearest_neighbors(
@@ -698,16 +701,86 @@ tuple<double, double, double> get_global_distance(
     const vector<Eigen::Vector3d>& coords2
 ) {
     try {
-        auto [superposed_coords1, superposed_coords2, distances, indices] = find_nearest_neighbors(coords1, coords2);
-        double score = score_vector(indices);
-        if (superposed_coords1.size() == 0) {
+        vector<double> distances;
+        vector<int> indices;
+        constexpr double radius = 2.0;
+        double radius_sq = radius * radius;
+
+        int m = static_cast<int>(coords1.size());
+        int n = static_cast<int>(coords2.size());
+        vector<vector<double>> distance_matrix(m, vector<double>(n, 0.0));
+        vector<vector<int>> score_matrix(m, vector<int>(n, 0));
+        vector<vector<int>> dp(m + 1, vector<int>(n + 1, 0));
+
+        // Build KDTree on coords1 (transformed protein coords)
+        PointCloudAdapter adapter{coords1};
+        KDTree tree(3, adapter, nanoflann::KDTreeSingleIndexAdaptorParams(10));
+        tree.buildIndex();
+
+        for (int k = 0; k < n; ++k) {
+            std::vector<nanoflann::ResultItem<uint32_t, double>> matches;
+            tree.radiusSearch(coords2[k].data(), radius_sq, matches, nanoflann::SearchParameters());
+
+            for (const auto& match : matches) {
+                int idx = static_cast<int>(match.first);
+                double dist = sqrt(match.second);
+                score_matrix[idx][k] = 1;
+                distance_matrix[idx][k] = dist;
+                distances.push_back(dist);
+                indices.push_back(idx);
+            }
+        }
+
+        // DP alignment (Needleman-Wunsch style)
+        for (int i = 1; i <= m; ++i) {
+            for (int j = 1; j <= n; ++j) {
+                int current_score = score_matrix[i - 1][j - 1];
+                int diagonal = dp[i - 1][j - 1] + current_score;
+                int up = dp[i - 1][j];
+                int left = dp[i][j - 1];
+                dp[i][j] = std::max({diagonal, up, left});
+            }
+        }
+
+        // Traceback
+        vector<pair<int, int>> local_alignment;
+        vector<double> local_distances;
+
+        int i = m;
+        int j = n;
+        while (i > 0 || j > 0) {
+            if (i > 0 && j > 0 && dp[i][j] == dp[i - 1][j - 1] + score_matrix[i - 1][j - 1]) {
+                if (score_matrix[i - 1][j - 1] == 1) {
+                    local_alignment.push_back({i - 1, j - 1});
+                    local_distances.push_back(distance_matrix[i - 1][j - 1]);
+                }
+                --i; --j;
+            } else if (i > 0 && dp[i][j] == dp[i - 1][j]) {
+                --i;
+            } else {
+                --j;
+            }
+        }
+
+        std::reverse(local_alignment.begin(), local_alignment.end());
+        std::reverse(local_distances.begin(), local_distances.end());
+
+        if (local_alignment.size() == 0) {
             return make_tuple(100.0, 100.0, 100.0);
         }
-        double rmsd = accumulate(distances.begin(), distances.end(), 0.0) / distances.size();
-        if (static_cast<double>(superposed_coords1.size()) / coords1.size() < 0.03) {
-            return make_tuple(score, rmsd / (static_cast<double>(superposed_coords1.size()) / coords1.size() / 10.0), static_cast<double>(superposed_coords1.size()) / coords1.size());
+
+        double alignment_score = score_vector(indices);
+
+        double rmsd = 0.0;
+        for (const auto& val : distances) {
+            rmsd += val * val;
         }
-        return make_tuple(score, rmsd / (static_cast<double>(superposed_coords1.size()) / coords1.size()), static_cast<double>(superposed_coords1.size()) / coords1.size());
+        rmsd = sqrt(rmsd / static_cast<double>(distances.size()));
+
+        double percentage = static_cast<double>(indices.size()) / static_cast<double>(coords1.size());
+        double rmsd_div_percentage = rmsd / percentage;
+
+        return make_tuple(alignment_score, rmsd_div_percentage, percentage);
     } catch (const exception& e) {
         cerr << e.what() << endl;
         return make_tuple(40.0, 100.0, 100.0);

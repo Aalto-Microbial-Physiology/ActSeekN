@@ -223,12 +223,8 @@ tuple<double, vector<double>, double, vector<Eigen::Vector3d>, vector<pair<int, 
     const double aa_around,
     const double threshold);
 
-double score(vector<int> vec, double size);
-double score_vector(vector<int> vec);
-
-tuple<vector<Eigen::Vector3d>, vector<Eigen::Vector3d>, vector<double>, vector<int>> find_nearest_neighbors(
-    const vector<Eigen::Vector3d>& vector1,
-    const vector<Eigen::Vector3d>& vector2);
+double calculate_score(vector<int>& indices, double weight);
+double score_vector(vector<int>& indices);
 
 tuple<double, double, double> get_global_distance(
     const vector<Eigen::Vector3d>& coords1,

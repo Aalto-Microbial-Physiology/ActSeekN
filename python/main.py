@@ -214,6 +214,30 @@ def _build_result_filename(case_request, resolved_entry):
     return f"actseekn-{original_label}-inferred-{resolved_label}-results.csv"
 
 
+def _find_existing_result(case_request, results_dir):
+    original_label = _sanitize_filename_part(
+        case_request.get("requested_entry") or case_request.get("entry_seq_ref") or case_request["query_label"]
+    )
+
+    direct_result = results_dir / f"actseekn-{original_label}-results.csv"
+    if direct_result.is_file():
+        return direct_result, original_label, None
+
+    fallback_results = sorted(results_dir.glob(f"actseekn-{original_label}-inferred-*-results.csv"))
+    if fallback_results:
+        result_file = fallback_results[0]
+        prefix = f"actseekn-{original_label}-inferred-"
+        suffix = "-results.csv"
+        filename = result_file.name
+        if filename.startswith(prefix) and filename.endswith(suffix):
+            resolved_entry = filename[len(prefix):-len(suffix)]
+        else:
+            resolved_entry = None
+        return result_file, resolved_entry, "cached_fallback"
+
+    return None, None, None
+
+
 def _build_case_result(case_request, success, resolved_uniprot=None, inferring_method=None):
     return {
         "success": success,
@@ -619,6 +643,16 @@ def calc(case_request, segment_name, table_name, results_dir, metadata_lookup):
         requested_entry = case_request["requested_entry"]
         logging.debug(f'{query_label} started...')
 
+        existing_result, cached_resolved_entry, cached_method = _find_existing_result(case_request, results_dir)
+        if existing_result is not None:
+            logging.debug(f'{query_label} had existing results.')
+            return _build_case_result(
+                case_request,
+                True,
+                cached_resolved_entry or requested_entry,
+                cached_method,
+            )
+
         resolved_entry, case_protein_filepath, resolution_method = _resolve_case_structure(case_request)
         result_file = results_dir / _build_result_filename(case_request, resolved_entry)
         if result_file.is_file():
@@ -649,6 +683,9 @@ def calc(case_request, segment_name, table_name, results_dir, metadata_lookup):
 
 
 def check_gpu_availability():
+    if not ActSeekLib.gpu_enabled():
+        logging.debug("GPU explicitly disabled, using CPU only.")
+        return False
     try:
         subprocess.check_output('nvidia-smi')
         logging.debug("Nvidia GPU detected, using CPU/GPU hybrid.")
@@ -658,15 +695,27 @@ def check_gpu_availability():
         return False
 
 
+def _run_case_requests(executor_cls, max_workers, case_requests, segment_name, table_name, metadata_lookup):
+    with executor_cls(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(calc, case_request, segment_name, table_name, RESULTS_DIR, metadata_lookup)
+            for case_request in case_requests
+        ]
+        return [task.result() for task in futures]
+
+
 if __name__ == '__main__':
     try:
         parser = argparse.ArgumentParser()
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument('-f', '--file', type=str, help='The input CSV filename')
         group.add_argument('-p', '--protein', type=str, help='The name of the protein')
+        parser.add_argument('--cpu-only', action='store_true', help='Disable GPU usage even if a GPU is available')
         args = parser.parse_args()
     except Exception as e:
         parser.print_usage()
+    if args.cpu_only:
+        ActSeekLib.set_gpu_enabled(False)
     if args.file:
         input_file = Path(args.file).expanduser()
         case_requests, input_table, skipped_row_indices = _build_case_requests(input_file)
@@ -719,34 +768,50 @@ if __name__ == '__main__':
             MAX_PROCS = max(1, int(os.getenv('SLURM_CPUS_PER_TASK')) // 4)
         else:
             MAX_PROCS = max(1, os.cpu_count() // 4)
-        with concurrent.futures.ProcessPoolExecutor(max_workers=MAX_PROCS) as executor:
-            futures = [
-                executor.submit(calc, case_request, segment_name, table_name, RESULTS_DIR, metadata_lookup)
-                for case_request in case_requests
-            ]
-            success = 0
-            failed_row_indices = list(skipped_row_indices)
-            fallback_rows = []
-            for case_request, task in zip(case_requests, futures):
-                result = task.result()
-                if result["success"]:
-                    success += 1
-                else:
-                    failed_row_indices.append(case_request["row_index"])
-                if result["inferring_method"]:
-                    fallback_rows.append({
-                        "resolved_uniprot": result["resolved_uniprot"] or "",
-                        "original_uniprot": result["original_uniprot"] or "",
-                        "seq_ref": result["entry_seq_ref"] or "",
-                        "inferring_method": result["inferring_method"],
-                    })
-            failed = total_requested - success
-            logging.debug(f'{success}/{total_requested} tasks completed, {failed}/{total_requested} tasks failed.')
-            if input_table is not None:
-                _write_failed_input_rows(input_file, input_table, failed_row_indices)
-                _write_fallback_rows(input_file, fallback_rows)
-    except:
-        logging.error("All tasks failed!")
+        try:
+            results = _run_case_requests(
+                concurrent.futures.ProcessPoolExecutor,
+                MAX_PROCS,
+                case_requests,
+                segment_name,
+                table_name,
+                metadata_lookup,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"ProcessPoolExecutor failed ({exc}); falling back to ThreadPoolExecutor."
+            )
+            results = _run_case_requests(
+                concurrent.futures.ThreadPoolExecutor,
+                1,
+                case_requests,
+                segment_name,
+                table_name,
+                metadata_lookup,
+            )
+
+        success = 0
+        failed_row_indices = list(skipped_row_indices)
+        fallback_rows = []
+        for case_request, result in zip(case_requests, results):
+            if result["success"]:
+                success += 1
+            else:
+                failed_row_indices.append(case_request["row_index"])
+            if result["inferring_method"]:
+                fallback_rows.append({
+                    "resolved_uniprot": result["resolved_uniprot"] or "",
+                    "original_uniprot": result["original_uniprot"] or "",
+                    "seq_ref": result["entry_seq_ref"] or "",
+                    "inferring_method": result["inferring_method"],
+                })
+        failed = total_requested - success
+        logging.debug(f'{success}/{total_requested} tasks completed, {failed}/{total_requested} tasks failed.')
+        if input_table is not None:
+            _write_failed_input_rows(input_file, input_table, failed_row_indices)
+            _write_fallback_rows(input_file, fallback_rows)
+    except Exception as exc:
+        logging.error(f"Task execution failed: {exc}")
     
     finally:
         ActSeekLib.destroySharedEntries(segment_name)

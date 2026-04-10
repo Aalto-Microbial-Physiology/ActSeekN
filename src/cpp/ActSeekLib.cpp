@@ -4,6 +4,35 @@
 
 
 const int MAX_THREADS = 8;
+bool GPU_ENABLED = true;
+
+size_t get_thread_pool_size() {
+    if (const char* env_var = std::getenv("ACTSEEK_THREADS")) {
+        try {
+            int configured = std::stoi(env_var);
+            if (configured > 0) {
+                return static_cast<size_t>(configured);
+            }
+        } catch (...) {
+        }
+    }
+
+    const unsigned int hardware_threads = std::thread::hardware_concurrency();
+    if (hardware_threads == 0) {
+        return MAX_THREADS;
+    }
+
+    return std::max<size_t>(1, std::min<size_t>(MAX_THREADS, hardware_threads));
+}
+
+void set_gpu_enabled(bool enabled) {
+    GPU_ENABLED = enabled;
+}
+
+bool gpu_enabled() {
+    return GPU_ENABLED;
+}
+
 const unordered_map<string, string> aa_des = {{"GLY", "GLY"}, {"ALA", "ALA"}, {"PRO", "PRO"}, {"ARG", "ARG"}, {"HIS", "HIS"}, {"LYS", "LYS"}, {"ASP", "ASP"},
                   {"GLU", "GLU"},
                   {"SER", "SER"}, {"THR", "THR"}, {"ASN", "ASN"}, {"GLN", "GLN"}, {"CYS", "CYS"}, {"VAL", "VAL"}, {"ILE", "ILE"},
@@ -300,7 +329,7 @@ vector<array<pair<int, int>, 3>> Active_site::get_all_possible_combinations(
     const unordered_map<string, string>& aa_des) {
     unordered_map<tuple<int, int>, bool, tuple_hash> dist_cache;
     vector<array<pair<int, int>, 3>> valid_combinations;
-    if (is_gpu_available() && pc.size() > 1000) {
+    if (gpu_enabled() && is_gpu_available() && pc.size() > 1000) {
         dist_cache = check_distances_on_gpu(pc, protein_coords, aa, real_index, threshold, aa_des);
     } 
     // else {
@@ -787,16 +816,7 @@ vector<result_t> concurrentMain(
     const string& segment_name,
     const string& table_name) {
     try {
-        // int max_threads = std::thread::hardware_concurrency() - 2;
-        // char* env_var = std::getenv("SLURM_CPUS_PER_TASK");
-        // if (env_var) {
-        //     max_threads = std::stoi(env_var) - 2;
-        // }
-        // int pool_size = MAX_THREADS;
-        // if (is_gpu_available()) {
-        //     pool_size = MAX_THREADS * 2;
-        // }
-        ThreadPool pool(MAX_THREADS);
+        ThreadPool pool(get_thread_pool_size());
         bip::managed_shared_memory shared_entries(bip::open_read_only, segment_name.c_str());
         ShmemEntryVector* entries = shared_entries.find<ShmemEntryVector>(table_name.c_str()).first;
         vector<future<result_t>> futures;
@@ -823,8 +843,26 @@ vector<result_t> concurrentMain(
             vector<int> active(entry.active.begin(), entry.active.end());
             unordered_map<int, int> real_index_seed = entry.real_index_seed;
 
-            futures.push_back(pool.enqueue(proteinRansacMain_t, i, active_indices, aa_des, 3000, seed_protein, case_protein, ec, protein_coords, protein_coords_cb, 
-                seed_coords, cavity_coords, cavity_coords_cb, aa, aa_cav, active, real_index, real_index_seed));
+            futures.push_back(pool.enqueue(
+                proteinRansacMain_t,
+                i,
+                std::move(active_indices),
+                std::cref(aa_des),
+                3000,
+                std::move(seed_protein),
+                std::cref(case_protein),
+                std::move(ec),
+                std::cref(protein_coords),
+                std::cref(protein_coords_cb),
+                std::move(seed_coords),
+                std::move(cavity_coords),
+                std::move(cavity_coords_cb),
+                std::cref(aa),
+                std::move(aa_cav),
+                std::move(active),
+                std::cref(real_index),
+                std::move(real_index_seed)
+            ));
         }
         for (auto& fut : futures) {
             auto result = fut.get();
@@ -843,4 +881,6 @@ PYBIND11_MODULE(ActSeekLib, m) {
     m.def("concurrentMain", &concurrentMain, "concurrentMain");
     m.def("createSharedEntries", &createSharedEntries, "createSharedEntries");
     m.def("destroySharedEntries", &destroySharedEntries, "destroySharedEntries");
+    m.def("set_gpu_enabled", &set_gpu_enabled, "Enable or disable GPU usage");
+    m.def("gpu_enabled", &gpu_enabled, "Return whether GPU usage is enabled");
 }

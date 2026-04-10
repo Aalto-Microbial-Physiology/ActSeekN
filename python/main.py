@@ -14,7 +14,6 @@ from Bio.PDB import *
 import subprocess
 import concurrent.futures
 from dataclasses import dataclass
-from difflib import SequenceMatcher
 import ActSeekLib
 
 
@@ -31,11 +30,7 @@ ROOT_DIR = SCRIPT_DIR.parent
 DATA_DIR = ROOT_DIR / "data"
 STRUCTURES_DIR = ROOT_DIR / "structures"
 RESULTS_DIR = ROOT_DIR / "results"
-HMMER_SEARCH_URL = "https://www.ebi.ac.uk/Tools/hmmer/api/v1/search/phmmer"
-HMMER_RESULT_URL = "https://www.ebi.ac.uk/Tools/hmmer/api/v1/result/{job_id}"
 ALPHAFOLD_PDB_URL = "https://alphafold.ebi.ac.uk/files/AF-{accession}-F1-model_v6.pdb"
-UNIPROT_SEARCH_URL = "https://rest.uniprot.org/uniprotkb/search"
-UNIPROT_ENTRY_URL = "https://rest.uniprot.org/uniprotkb/{accession}.json"
 
 aa_codes = {
     "ALA": 1, "ARG": 2, "ASN": 3, "ASP": 4, "CYS": 5,
@@ -44,9 +39,6 @@ aa_codes = {
     "SER": 16, "THR": 17, "TRP": 18, "TYR": 19, "VAL": 20,
     "SEC": 21
     }
-
-_uniprot_sequence_cache = {}
-
 
 def _decode_scalar(value):
     if isinstance(value, bytes):
@@ -192,307 +184,31 @@ def _sanitize_filename_part(value):
     return sanitized.strip("._-") or "row"
 
 
-def _normalize_ec_number(value):
-    text = _clean_optional_text(value)
-    if not text:
-        return None
-    match = re.search(r"\d+\.\d+\.\d+\.(?:\d+|-)", text)
-    return match.group(0) if match else text
-
-
 def _build_result_filename(case_request, resolved_entry):
-    requested_entry = case_request.get("requested_entry")
-    entry_seq_ref = case_request.get("entry_seq_ref")
-    original_label = _sanitize_filename_part(
-        requested_entry or entry_seq_ref or case_request["query_label"]
-    )
-    resolved_label = _sanitize_filename_part(resolved_entry)
-
-    if original_label == resolved_label:
-        return f"actseekn-{original_label}-results.csv"
-
-    return f"actseekn-{original_label}-inferred-{resolved_label}-results.csv"
+    original_label = _sanitize_filename_part(case_request["requested_entry"])
+    return f"actseekn-{original_label}-results.csv"
 
 
 def _find_existing_result(case_request, results_dir):
-    original_label = _sanitize_filename_part(
-        case_request.get("requested_entry") or case_request.get("entry_seq_ref") or case_request["query_label"]
-    )
+    requested_entry = case_request.get("requested_entry")
+    if not requested_entry:
+        return None, None, None
 
-    direct_result = results_dir / f"actseekn-{original_label}-results.csv"
-    if direct_result.is_file():
-        return direct_result, original_label, None
+    original_label = _sanitize_filename_part(requested_entry)
 
-    fallback_results = sorted(results_dir.glob(f"actseekn-{original_label}-inferred-*-results.csv"))
-    if fallback_results:
-        result_file = fallback_results[0]
-        prefix = f"actseekn-{original_label}-inferred-"
-        suffix = "-results.csv"
-        filename = result_file.name
-        if filename.startswith(prefix) and filename.endswith(suffix):
-            resolved_entry = filename[len(prefix):-len(suffix)]
-        else:
-            resolved_entry = None
-        return result_file, resolved_entry, "cached_fallback"
-
-    return None, None, None
+    result_file = results_dir / f"actseekn-{original_label}-results.csv"
+    if result_file.is_file():
+        return result_file, original_label
+    return None, None
 
 
-def _build_case_result(case_request, success, resolved_uniprot=None, inferring_method=None):
+def _build_case_result(case_request, success, resolved_uniprot=None):
     return {
         "success": success,
         "row_index": case_request["row_index"],
         "resolved_uniprot": resolved_uniprot,
         "original_uniprot": case_request.get("requested_entry"),
-        "entry_seq_ref": case_request.get("entry_seq_ref"),
-        "inferring_method": inferring_method,
     }
-
-
-def _wait_for_hmmer_result(job_id, timeout_seconds=600, poll_seconds=3):
-    deadline = time.time() + timeout_seconds
-    while time.time() < deadline:
-        response = requests.get(
-            HMMER_RESULT_URL.format(job_id=job_id),
-            headers={"Accept": "application/json"},
-            timeout=30,
-        )
-        response.raise_for_status()
-        payload = response.json()
-        status = payload.get("status")
-        if status == "SUCCESS":
-            return payload
-        if status in {"FAILURE", "ERROR"}:
-            raise RuntimeError(f"HMMER search failed with status {status}.")
-        time.sleep(poll_seconds)
-    raise TimeoutError(f"HMMER search {job_id} did not finish within {timeout_seconds}s.")
-
-
-def _search_uniprot_by_sequence(sequence):
-    fasta = f">query\n{sequence}"
-    response = requests.post(
-        HMMER_SEARCH_URL,
-        json={"database": "uniprot", "input": fasta},
-        headers={"Accept": "application/json"},
-        timeout=30,
-    )
-    response.raise_for_status()
-    job_id = response.json()["id"]
-    result_payload = _wait_for_hmmer_result(job_id)
-    hits = result_payload.get("result", {}).get("hits", [])
-    candidates = []
-    for hit in hits:
-        metadata = hit.get("metadata") or {}
-        accession = metadata.get("uniprot_accession") or metadata.get("accession")
-        if not accession:
-            continue
-        candidates.append(
-            {
-                "accession": accession,
-                "identifier": metadata.get("uniprot_identifier") or metadata.get("identifier"),
-                "description": metadata.get("description"),
-                "evalue": hit.get("evalue"),
-            }
-        )
-    if not candidates:
-        raise LookupError("Sequence search returned no UniProt hits.")
-    return candidates
-
-
-def _search_uniprot_by_seq_ref(entry_seq_ref, ec_number=None, size=50):
-    if not entry_seq_ref:
-        return []
-
-    seq_ref = entry_seq_ref.strip()
-    query_variants = [
-        f'xref:RefSeq-{seq_ref}',
-        f'"{seq_ref}"',
-    ]
-    if ec_number:
-        query_variants = [f"({query}) AND (ec:{ec_number})" for query in query_variants] + query_variants
-
-    for query in query_variants:
-        response = requests.get(
-            UNIPROT_SEARCH_URL,
-            params={
-                "query": query,
-                "format": "json",
-                "size": size,
-                "fields": "accession,id,protein_name,ec",
-            },
-            timeout=60,
-        )
-        if response.status_code == 400:
-            logging.warning(f"UniProt search rejected query '{query}' for {seq_ref}; trying next strategy.")
-            continue
-        response.raise_for_status()
-        results = response.json().get("results", [])
-        candidates = []
-        for item in results:
-            accession = item.get("primaryAccession")
-            if not accession:
-                continue
-            candidates.append(
-                {
-                    "accession": accession,
-                    "identifier": item.get("uniProtkbId"),
-                    "description": (
-                        ((item.get("proteinDescription") or {}).get("recommendedName") or {})
-                        .get("fullName", {})
-                        .get("value")
-                    ),
-                }
-            )
-        if candidates:
-            logging.info(
-                f"Resolved {seq_ref} to UniProt candidates via UniProt search"
-                + (f" with EC {ec_number}" if ec_number else "")
-                + f"; first hit {candidates[0]['accession']}."
-            )
-            return candidates
-
-    return []
-
-
-def _search_uniprot_by_ec(ec_number, size=200):
-    if not ec_number:
-        return []
-
-    response = requests.get(
-        UNIPROT_SEARCH_URL,
-        params={
-            "query": f"ec:{ec_number}",
-            "format": "json",
-            "size": size,
-            "fields": "accession,id,protein_name,ec",
-        },
-        timeout=60,
-    )
-    response.raise_for_status()
-    results = response.json().get("results", [])
-    candidates = []
-    for item in results:
-        accession = item.get("primaryAccession")
-        if not accession:
-            continue
-        candidates.append(
-            {
-                "accession": accession,
-                "identifier": item.get("uniProtkbId"),
-                "description": (
-                    ((item.get("proteinDescription") or {}).get("recommendedName") or {})
-                    .get("fullName", {})
-                    .get("value")
-                ),
-            }
-        )
-    return candidates
-
-
-def _fetch_uniprot_sequence(accession):
-    if accession in _uniprot_sequence_cache:
-        return _uniprot_sequence_cache[accession]
-
-    response = requests.get(UNIPROT_ENTRY_URL.format(accession=accession), timeout=60)
-    if response.status_code == 404:
-        _uniprot_sequence_cache[accession] = None
-        return None
-    response.raise_for_status()
-    sequence = ((response.json().get("sequence") or {}).get("value") or "").strip() or None
-    _uniprot_sequence_cache[accession] = sequence
-    return sequence
-
-
-def _score_sequence_similarity(query_sequence, candidate_sequence):
-    if not query_sequence or not candidate_sequence:
-        return -1.0
-    return SequenceMatcher(None, query_sequence, candidate_sequence).ratio()
-
-
-def _rank_candidates_by_sequence(query_sequence, candidates, limit=50):
-    ranked = []
-    for candidate in candidates:
-        accession = candidate["accession"]
-        candidate_sequence = _fetch_uniprot_sequence(accession)
-        similarity = _score_sequence_similarity(query_sequence, candidate_sequence)
-        if similarity < 0:
-            continue
-        ranked.append((similarity, accession))
-
-    ranked.sort(key=lambda item: item[0], reverse=True)
-    accessions = []
-    for _, accession in ranked:
-        if accession not in accessions:
-            accessions.append(accession)
-        if len(accessions) >= limit:
-            break
-    return accessions
-
-
-def _dedupe_accessions(accessions, exclude_accession=None, limit=50):
-    deduped_accessions = []
-    for accession in accessions:
-        if accession == exclude_accession or accession in deduped_accessions:
-            continue
-        deduped_accessions.append(accession)
-        if len(deduped_accessions) >= limit:
-            break
-    return deduped_accessions
-
-
-def _infer_uniprot_fallback_tiers(case_request, exclude_accession=None):
-    entry_seq_ref = case_request.get("entry_seq_ref")
-    ec_number = case_request.get("ec_number")
-    sequence = case_request.get("sequence")
-    tiers = []
-
-    candidates = _search_uniprot_by_seq_ref(entry_seq_ref, ec_number=ec_number)
-    if candidates:
-        accessions = _dedupe_accessions(
-            [candidate["accession"] for candidate in candidates],
-            exclude_accession=exclude_accession,
-        )
-        if accessions:
-            tiers.append(("seq_ref", accessions))
-
-    if ec_number and sequence:
-        ec_candidates = _search_uniprot_by_ec(ec_number)
-        if ec_candidates:
-            accessions = _rank_candidates_by_sequence(sequence, ec_candidates)
-            if accessions:
-                logging.info(
-                    f"{case_request['query_label']} ranked UniProt candidates within EC {ec_number}; first hit {accessions[0]}."
-                )
-                accessions = _dedupe_accessions(accessions, exclude_accession=exclude_accession)
-                if accessions:
-                    tiers.append(("ec_sequence", accessions))
-
-    if sequence and not tiers:
-        logging.info(
-            f"{case_request['query_label']} could not be resolved from sequence reference"
-            + (f" {entry_seq_ref}" if entry_seq_ref else "")
-            + " or EC-filtered sequence ranking; falling back to HMMER sequence search."
-        )
-        candidates = _search_uniprot_by_sequence(sequence)
-        accessions = _dedupe_accessions(
-            [candidate["accession"] for candidate in candidates],
-            exclude_accession=exclude_accession,
-        )
-        if accessions:
-            tiers.append(("hmmer", accessions))
-
-    return tiers
-
-
-def _infer_uniprot_fallbacks(case_request, exclude_accession=None):
-    tiers = _infer_uniprot_fallback_tiers(case_request, exclude_accession=exclude_accession)
-    for method, accessions in tiers:
-        try:
-            resolved_entry, structure_path = _resolve_structure_from_accessions(accessions)
-            return resolved_entry, structure_path, method
-        except FileNotFoundError:
-            continue
-    raise FileNotFoundError("No AlphaFold structure found for any fallback UniProt accession.")
 
 
 def _build_case_requests(input_file):
@@ -506,24 +222,17 @@ def _build_case_requests(input_file):
 
     for row_index, row in table.iterrows():
         entry = _clean_optional_text(row.get("Entry"))
-        sequence = _clean_optional_text(row.get("Sequence"))
-        entry_seq_ref = _clean_optional_text(row.get("Entry_seq_ref"))
-        ec_number = _normalize_ec_number(row.get("EC") if "EC" in row.index else row.get("EC number"))
-        label = _sanitize_filename_part(entry or entry_seq_ref or f"row{row_index + 1}")
-        if not entry and not sequence:
+        label = _sanitize_filename_part(entry or f"row{row_index + 1}")
+        if not entry:
             skipped_rows += 1
             skipped_row_indices.append(row_index)
-            logging.warning(f"Skipping row {row_index + 1}: empty Entry and no Sequence provided.")
+            logging.warning(f"Skipping row {row_index + 1}: empty Entry provided.")
             continue
 
         case_request = {
             "row_index": row_index,
             "query_label": label,
             "requested_entry": entry,
-            "requested_accessions": [entry] if entry else [],
-            "entry_seq_ref": entry_seq_ref,
-            "sequence": sequence,
-            "ec_number": ec_number,
         }
         case_requests.append(case_request)
 
@@ -538,13 +247,6 @@ def _write_failed_input_rows(input_file, input_table, failed_row_indices):
     output_path = RESULTS_DIR / f"{input_file.stem}_failed.csv"
     input_table.iloc[failed_rows].to_csv(output_path, index=False)
     logging.info(f"Wrote {len(failed_rows)} failed input rows to {output_path}.")
-
-
-def _write_fallback_rows(input_file, fallback_rows):
-    output_path = RESULTS_DIR / f"{input_file.stem}_fallbacks.csv"
-    report = pd.DataFrame(fallback_rows)
-    report.to_csv(output_path, index=False)
-    logging.info(f"Wrote {len(report)} fallback resolution rows to {output_path}.")
 
 
 def _download_structure(accession):
@@ -567,53 +269,37 @@ def _download_structure(accession):
     return structure_path
 
 
-def _resolve_structure_from_accessions(accessions):
-    for accession in accessions:
-        try:
-            structure_path = _download_structure(accession)
-        except Exception as exc:
-            logging.warning(f"{accession} structure download failed: {exc}")
-            continue
-        if structure_path is not None:
-            return accession, structure_path
-    raise FileNotFoundError("No AlphaFold structure found for any fallback UniProt accession.")
-
-
 def _resolve_case_structure(case_request):
-    sequence = case_request.get("sequence")
     requested_entry = case_request.get("requested_entry")
-    entry_seq_ref = case_request.get("entry_seq_ref")
-
     if not requested_entry:
-        if not sequence and not entry_seq_ref:
-            raise FileNotFoundError("No UniProt entry, sequence reference, or Sequence available for inference.")
-        logging.info(
-            f"{case_request['query_label']} has no UniProt entry; trying inferred UniProt resolution"
-            + (f" using {entry_seq_ref} as sequence reference" if entry_seq_ref else "")
-            + (f" and EC {case_request['ec_number']}" if case_request.get("ec_number") else "")
-            + "."
-        )
-        resolved_entry, structure_path, method = _infer_uniprot_fallbacks(case_request)
-        return resolved_entry, structure_path, method or "sequence_inferred"
+        raise FileNotFoundError("No UniProt entry provided.")
+
+    af_structure_path = STRUCTURES_DIR / f"AF-{requested_entry}-F1-model_v6.pdb"
+    if af_structure_path.is_file():
+        return requested_entry, af_structure_path, None
+
+    local_pdb_path = STRUCTURES_DIR / f"{requested_entry}.pdb"
+    if local_pdb_path.is_file():
+        return requested_entry, local_pdb_path, None
+
+    local_cif_path = STRUCTURES_DIR / f"{requested_entry}.cif"
+    if local_cif_path.is_file():
+        return requested_entry, local_cif_path, None
 
     try:
-        resolved_entry, structure_path = _resolve_structure_from_accessions(case_request["requested_accessions"])
-        return resolved_entry, structure_path, None
-    except FileNotFoundError:
-        if not requested_entry or not sequence:
-            raise
+        structure_path = _download_structure(requested_entry)
+    except Exception as exc:
+        raise FileNotFoundError(f"Structure download failed for {requested_entry}: {exc}") from exc
+    if structure_path is not None:
+        return requested_entry, structure_path, None
 
-        logging.warning(
-            f"{case_request['query_label']} could not use UniProt entry {requested_entry}; trying inferred UniProt resolution."
-        )
-        resolved_entry, structure_path, method = _infer_uniprot_fallbacks(
-            case_request, exclude_accession=requested_entry
-        )
-        return resolved_entry, structure_path, method or "sequence_inferred"
+    raise FileNotFoundError(
+        f"No structure found for {requested_entry} in structures/ or AlphaFold DB."
+    )
 
 
 def read_pdbs(case_protein):
-    parser = PDBParser()
+    parser = MMCIFParser() if Path(case_protein).suffix.lower() == ".cif" else PDBParser()
     case_structure = parser.get_structure("complex2", case_protein)
     aa = {}
     protein_coords = []
@@ -643,27 +329,18 @@ def calc(case_request, segment_name, table_name, results_dir, metadata_lookup):
         requested_entry = case_request["requested_entry"]
         logging.debug(f'{query_label} started...')
 
-        existing_result, cached_resolved_entry, cached_method = _find_existing_result(case_request, results_dir)
+        existing_result, cached_resolved_entry = _find_existing_result(case_request, results_dir)
         if existing_result is not None:
             logging.debug(f'{query_label} had existing results.')
-            return _build_case_result(
-                case_request,
-                True,
-                cached_resolved_entry or requested_entry,
-                cached_method,
-            )
+            return _build_case_result(case_request, True, cached_resolved_entry or requested_entry)
 
-        resolved_entry, case_protein_filepath, resolution_method = _resolve_case_structure(case_request)
+        resolved_entry, case_protein_filepath, _ = _resolve_case_structure(case_request)
         result_file = results_dir / _build_result_filename(case_request, resolved_entry)
         if result_file.is_file():
             logging.debug(f'{query_label} had existing results.')
-            return _build_case_result(case_request, True, resolved_entry, resolution_method)
+            return _build_case_result(case_request, True, resolved_entry)
         if requested_entry and requested_entry == resolved_entry:
             logging.debug(f"{query_label} used UniProt entry {resolved_entry}.")
-        elif requested_entry:
-            logging.debug(f"{query_label} used fallback UniProt entry {resolved_entry} instead of {requested_entry}.")
-        else:
-            logging.debug(f"{query_label} inferred UniProt entry {resolved_entry} from Sequence.")
 
         case_protein_profile = [resolved_entry] + list(read_pdbs(str(case_protein_filepath)))
 
@@ -676,10 +353,10 @@ def calc(case_request, segment_name, table_name, results_dir, metadata_lookup):
         dataset = dataset.sort_values(by=['RMSDmin']).round(6)
         dataset.to_csv(result_file, index=False)
         logging.debug(f"{query_label} took {time.perf_counter() - start_time:.2f}s to find {len(results)} results.")
-        return _build_case_result(case_request, True, resolved_entry, resolution_method)
+        return _build_case_result(case_request, True, resolved_entry)
     except Exception as e:
         logging.error(f"{case_request.get('query_label', 'query')} failed with {e}")
-        return _build_case_result(case_request, False, None, "unresolved")
+        return _build_case_result(case_request, False, None)
 
 
 def check_gpu_availability():
@@ -725,9 +402,6 @@ if __name__ == '__main__':
             "row_index": 0,
             "query_label": _sanitize_filename_part(args.protein),
             "requested_entry": args.protein,
-            "requested_accessions": [args.protein],
-            "entry_seq_ref": None,
-            "sequence": None,
         }]
         total_requested = 1
         input_table = None
@@ -792,24 +466,15 @@ if __name__ == '__main__':
 
         success = 0
         failed_row_indices = list(skipped_row_indices)
-        fallback_rows = []
         for case_request, result in zip(case_requests, results):
             if result["success"]:
                 success += 1
             else:
                 failed_row_indices.append(case_request["row_index"])
-            if result["inferring_method"]:
-                fallback_rows.append({
-                    "resolved_uniprot": result["resolved_uniprot"] or "",
-                    "original_uniprot": result["original_uniprot"] or "",
-                    "seq_ref": result["entry_seq_ref"] or "",
-                    "inferring_method": result["inferring_method"],
-                })
         failed = total_requested - success
         logging.debug(f'{success}/{total_requested} tasks completed, {failed}/{total_requested} tasks failed.')
         if input_table is not None:
             _write_failed_input_rows(input_file, input_table, failed_row_indices)
-            _write_fallback_rows(input_file, fallback_rows)
     except Exception as exc:
         logging.error(f"Task execution failed: {exc}")
     

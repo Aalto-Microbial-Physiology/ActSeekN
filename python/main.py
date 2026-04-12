@@ -249,9 +249,26 @@ def _write_failed_input_rows(input_file, input_table, failed_row_indices):
     logging.info(f"Wrote {len(failed_rows)} failed input rows to {output_path}.")
 
 
+def _is_nonempty_file(path):
+    if not path.is_file() or path.stat().st_size == 0:
+        return False
+
+    suffix = path.suffix.lower()
+    parser = MMCIFParser(QUIET=True) if suffix == ".cif" else PDBParser(QUIET=True)
+    try:
+        structure = parser.get_structure("validation", str(path))
+    except Exception:
+        return False
+
+    for atom in structure.get_atoms():
+        if atom.get_name().strip() in {"CA", "CB", "N", "C", "O"}:
+            return True
+    return False
+
+
 def _download_structure(accession):
     structure_path = STRUCTURES_DIR / f"AF-{accession}-F1-model_v6.pdb"
-    if structure_path.is_file():
+    if _is_nonempty_file(structure_path):
         return structure_path
 
     response = requests.get(
@@ -275,15 +292,15 @@ def _resolve_case_structure(case_request):
         raise FileNotFoundError("No UniProt entry provided.")
 
     af_structure_path = STRUCTURES_DIR / f"AF-{requested_entry}-F1-model_v6.pdb"
-    if af_structure_path.is_file():
+    if _is_nonempty_file(af_structure_path):
         return requested_entry, af_structure_path, None
 
     local_pdb_path = STRUCTURES_DIR / f"{requested_entry}.pdb"
-    if local_pdb_path.is_file():
+    if _is_nonempty_file(local_pdb_path):
         return requested_entry, local_pdb_path, None
 
     local_cif_path = STRUCTURES_DIR / f"{requested_entry}.cif"
-    if local_cif_path.is_file():
+    if _is_nonempty_file(local_cif_path):
         return requested_entry, local_cif_path, None
 
     try:
@@ -387,12 +404,15 @@ if __name__ == '__main__':
         group = parser.add_mutually_exclusive_group(required=True)
         group.add_argument('-f', '--file', type=str, help='The input CSV filename')
         group.add_argument('-p', '--protein', type=str, help='The name of the protein')
+        parser.add_argument('--threads-per-worker', type=int, default=8, help='Set the number of worker threads used inside each ActSeekN worker process')
         parser.add_argument('--cpu-only', action='store_true', help='Disable GPU usage even if a GPU is available')
         args = parser.parse_args()
     except Exception as e:
         parser.print_usage()
-    if args.cpu_only:
-        ActSeekLib.set_gpu_enabled(False)
+    if args.threads_per_worker <= 0:
+        raise ValueError("--threads-per-worker must be a positive integer.")
+    ActSeekLib.set_thread_pool_size(args.threads_per_worker)
+    ActSeekLib.set_gpu_enabled(not args.cpu_only)
     if args.file:
         input_file = Path(args.file).expanduser()
         case_requests, input_table, skipped_row_indices = _build_case_requests(input_file)
@@ -438,10 +458,11 @@ if __name__ == '__main__':
         sys.exit(1)
         
     try:
+        threads_per_worker = max(1, int(ActSeekLib.get_thread_pool_size()))
         if os.getenv('SLURM_CPUS_PER_TASK'):
-            MAX_PROCS = max(1, int(os.getenv('SLURM_CPUS_PER_TASK')) // 4)
+            MAX_PROCS = max(1, int(os.getenv('SLURM_CPUS_PER_TASK')) // threads_per_worker)
         else:
-            MAX_PROCS = max(1, os.cpu_count() // 4)
+            MAX_PROCS = max(1, (os.cpu_count() or 1) // threads_per_worker)
         try:
             results = _run_case_requests(
                 concurrent.futures.ProcessPoolExecutor,

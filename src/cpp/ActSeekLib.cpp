@@ -3,26 +3,15 @@
 #include "shared_memory.h"
 
 
-const int MAX_THREADS = 8;
+size_t THREAD_POOL_SIZE = 8;
 bool GPU_ENABLED = true;
 
 size_t get_thread_pool_size() {
-    if (const char* env_var = std::getenv("ACTSEEK_THREADS")) {
-        try {
-            int configured = std::stoi(env_var);
-            if (configured > 0) {
-                return static_cast<size_t>(configured);
-            }
-        } catch (...) {
-        }
-    }
+    return THREAD_POOL_SIZE;
+}
 
-    const unsigned int hardware_threads = std::thread::hardware_concurrency();
-    if (hardware_threads == 0) {
-        return MAX_THREADS;
-    }
-
-    return std::max<size_t>(1, std::min<size_t>(MAX_THREADS, hardware_threads));
+void set_thread_pool_size(size_t size) {
+    THREAD_POOL_SIZE = std::max<size_t>(1, size);
 }
 
 void set_gpu_enabled(bool enabled) {
@@ -954,6 +943,8 @@ PYBIND11_MODULE(ActSeekLib, m) {
     m.def("concurrentMain", &concurrentMain, "concurrentMain");
     m.def("createSharedEntries", &createSharedEntries, "createSharedEntries");
     m.def("destroySharedEntries", &destroySharedEntries, "destroySharedEntries");
+    m.def("get_thread_pool_size", &get_thread_pool_size, "Return ActSeek C++ thread pool size");
+    m.def("set_thread_pool_size", &set_thread_pool_size, "Set ActSeek C++ thread pool size");
     m.def("set_gpu_enabled", &set_gpu_enabled, "Enable or disable GPU usage");
     m.def("gpu_enabled", &gpu_enabled, "Return whether GPU usage is enabled");
 }

@@ -118,6 +118,12 @@ python python/main.py -p P12345
 python python/main.py -f data/proteins_yeast.csv
 ```
 
+### Runtime controls
+
+- `--threads-per-worker`: Controls the thread pool size inside each ActSeekN worker process. Default: `8`.
+
+- `--cpu-only`: Disable GPU usage even if a GPU is available.
+
 ### Structure resolution
 
 For each input `Entry`, the pipeline looks for a structure in this order:
@@ -172,6 +178,6 @@ python main.py -f ../data/proteins_yeast.csv
 
 ## Notes
 
-- The process pool size is based on `SLURM_CPUS_PER_TASK` when available, otherwise `os.cpu_count() // 4`.
+- The worker process pool size is derived from the available CPU count and the current value of `--threads-per-worker`.
 - Existing result files are reused instead of recomputed.
 - The pipeline creates `results/` and `structures/` automatically if they do not already exist.

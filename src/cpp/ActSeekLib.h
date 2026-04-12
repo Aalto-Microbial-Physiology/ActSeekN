@@ -36,6 +36,8 @@ namespace py = pybind11;
 
 extern bool* cuda_check_distances(float* coord_vecs1, float* coord_vecs2, float* distances_vecs, int* distances_offsets, int* distances_sizes, int n_vecs, int n_dim, float threshold);
 extern bool is_gpu_available();
+size_t get_thread_pool_size();
+void set_thread_pool_size(size_t size);
 void set_gpu_enabled(bool enabled);
 bool gpu_enabled();
 

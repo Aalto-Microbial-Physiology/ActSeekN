@@ -367,7 +367,7 @@ def calc(case_request, segment_name, table_name, results_dir, metadata_lookup):
         metadata = dataset["ID"].map(metadata_lookup).apply(pd.Series)
         dataset["Confidence"] = metadata.get("Confidence")
         dataset["Description"] = metadata.get("Description")
-        dataset = dataset.sort_values(by=['RMSDmin']).round(6)
+        dataset = dataset.sort_values(by=['Structure score'], ascending=False).round(6)
         dataset.to_csv(result_file, index=False)
         logging.debug(f"{query_label} took {time.perf_counter() - start_time:.2f}s to find {len(results)} results.")
         return _build_case_result(case_request, True, resolved_entry)

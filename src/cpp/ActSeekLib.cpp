@@ -824,8 +824,8 @@ tuple<bool, string, string, double, double, double, double, double, string> prot
             cavity_coords, protein_coords, protein_coords_cb, seed_coords, valid_combinations,
             iterations, aa_des, aa, real_index, real_index_seed, aa_cav, active, cavity_coords_used, cavity_coords_cb_used, 3.0, threshold);
 
-        // It only saves the solution if the maximum deviating distance is less than 1 (that could also be another argument in the main function defined by the user, or use the same threshold as in the previous function)
-        if (accumulate(distances.begin(), distances.end(), 0.0) / distances.size() < 1 && distances_arround < 3.0 && solution.size() >= 3) {
+        // It only saves the solution if the maximum deviating distance is less than 2 A(that could also be another argument in the main function defined by the user, or use the same threshold as in the previous function)
+        if (accumulate(distances.begin(), distances.end(), 0.0) / distances.size() < 2 && distances_arround < 3.0 && solution.size() >= 3) {
             auto [rmsd, minrmsd, percentage] = get_global_distance(t_transformed, seed_coords);
             string strmapping;
             for (const auto& aamap : solution) {
